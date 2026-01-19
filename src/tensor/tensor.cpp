@@ -165,6 +165,7 @@ void Tensor::debug() const {
 
 bool Tensor::isContiguous() const {
     //first initial expected stride(from lastdim to 0)
+    //test
     ptrdiff_t expected_stride = 1;
     for(int i = (int)ndim()-1; i >= 0; i--)
     {
