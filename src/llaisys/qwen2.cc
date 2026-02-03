@@ -341,9 +341,6 @@ struct LlaisysQwen2Model *llaisysQwen2ModelCreate(
     llaisysDeviceType_t device,
     int *device_ids,
     int ndevice) {
-    CHECK_ARGUMENT(meta != nullptr, "meta is null");
-    CHECK_ARGUMENT(device == LLAISYS_DEVICE_CPU, "Only CPU device is supported.");
-    CHECK_ARGUMENT(ndevice >= 1, "Invalid device count.");
 
     auto *model = new LlaisysQwen2Model();
     model->meta = *meta;
@@ -380,7 +377,6 @@ void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model *model) {
 
 // ModelWeights: Get weights pointer for loading pretrained params
 struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model *model) {
-    CHECK_ARGUMENT(model != nullptr, "model is null");
     return &model->weights;
 }
 
