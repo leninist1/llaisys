@@ -126,7 +126,7 @@ class Qwen2:
             return w.mlp_down_w[layer]
         return None
 
-    def _infer(self, tokens: Sequence[int]) -> int:
+    def _infer(self, tokens: Sequence[int], temperature: float, top_k: int, top_p: float, seed: int) -> int:
         # step forward infer
 
         if len(tokens) == 0:
@@ -135,7 +135,13 @@ class Qwen2:
         arr = (ctypes.c_int64 * len(tokens))(*tokens)
         return int(
             LIB_LLAISYS.llaisysQwen2ModelInfer(
-                self._model, arr, ctypes.c_size_t(len(tokens))
+                self._model,
+                arr,
+                ctypes.c_size_t(len(tokens)),
+                ctypes.c_float(temperature),
+                ctypes.c_size_t(top_k),
+                ctypes.c_float(top_p),
+                ctypes.c_int64(seed),
             )
         )
 
@@ -146,6 +152,7 @@ class Qwen2:
         top_k: int = 1,
         top_p: float = 0.8,
         temperature: float = 0.8,
+        seed: int = 0,
     ):
         # max new tokens default value:32
         if max_new_tokens is None:
@@ -154,12 +161,13 @@ class Qwen2:
         if max_new_tokens == 0:
             return tokens
         # prefill
-        next_token = self._infer(tokens)
+        next_token = self._infer(tokens, temperature, top_k, top_p, seed)
         tokens.append(next_token)
         # decode
         for _ in range(max_new_tokens - 1):
             if tokens[-1] == self._end_token:
                 break
-            next_token = self._infer([tokens[-1]])
+            seed += 1
+            next_token = self._infer([tokens[-1]], temperature, top_k, top_p, seed)
             tokens.append(next_token)
         return tokens

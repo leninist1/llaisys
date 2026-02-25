@@ -3,7 +3,7 @@
 
 #include "../tensor/tensor.hpp"
 #include "../ops/add/op.hpp"
-#include "../ops/argmax/op.hpp"
+#include "../ops/rand_sample/op.hpp"
 #include "../ops/embedding/op.hpp"
 #include "../ops/linear/op.hpp"
 #include "../ops/rearrange/op.hpp"
@@ -197,7 +197,8 @@ static void init_cache(LlaisysQwen2Model *model) {
 }
 
 // inference implementation
-static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, size_t ntoken) {
+static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, size_t ntoken, float temperature,
+                          size_t topK, float topP, int64_t seed) {
     CHECK_ARGUMENT(model != nullptr, "model is null");
     CHECK_ARGUMENT(token_ids != nullptr || ntoken == 0, "token_ids is null");
     CHECK_ARGUMENT(model->device == LLAISYS_DEVICE_CPU, "Only CPU device is supported.");
@@ -323,13 +324,13 @@ static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, si
     auto logits = make_tensor(model->meta, model->device, model->device_id, {seqlen, model->meta.voc});
     llaisys::ops::linear(logits, x_norm, model->weights.out_embed->tensor, model->out_bias);
 
-    // get last token logits and argmax
+    // get last token logits and sample
     auto last = logits->slice(0, seqlen - 1, seqlen)->view({model->meta.voc});
-    auto max_idx = make_tensor_dtype(LLAISYS_DTYPE_I64, model->device, model->device_id, {1});
-    auto max_val = make_tensor(model->meta, model->device, model->device_id, {1});
-    llaisys::ops::argmax(max_idx, max_val, last);
+    auto sample_idx = make_tensor_dtype(LLAISYS_DTYPE_I64, model->device, model->device_id, {1});
+    auto sample_val = make_tensor(model->meta, model->device, model->device_id, {1});
+    llaisys::ops::rand_sample(sample_idx, sample_val, last, temperature, topK, topP, seed);
 
-    return reinterpret_cast<int64_t *>(max_idx->data())[0];
+    return reinterpret_cast<int64_t *>(sample_idx->data())[0];
 }
 
 // C API wrapper
@@ -381,8 +382,9 @@ struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model *m
 }
 
 // ModelInfer: Single interface for single token prediction
-int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
-    return infer_impl(model, token_ids, ntoken);
+int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken, float temperature,
+                               size_t topK, float topP, int64_t seed) {
+    return infer_impl(model, token_ids, ntoken, temperature, topK, topP, seed);
 }
 
 }
