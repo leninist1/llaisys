@@ -61,7 +61,8 @@ static void rand_sample_(std::byte *sample_idx, std::byte *sample_val, const std
         for (size_t i = 0; i < numel; ++i) {
             sorted_scores[i] = {scores[i], i};
         }
-        std::sort(sorted_scores.begin(), sorted_scores.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        std::sort(sorted_scores.begin(), sorted_scores.end(), 
+        [](const auto &a, const auto &b) { return a.first > b.first; });
 
         size_t k = numel;
         if (topK > 0 && topK < numel) {
@@ -117,11 +118,14 @@ void rand_sample(std::byte *sample_idx, std::byte *sample_val, const std::byte *
                  const int64_t batch_size, const float temperature, const size_t topK, const float topP, const int64_t seed) {
     switch (type) {
     case LLAISYS_DTYPE_F32:
-        return rand_sample_<float>(sample_idx, sample_val, vals, temperature, topK, topP, numel, batch_size, seed);
+        return rand_sample_<float>(sample_idx, sample_val, vals, 
+            temperature, topK, topP, numel, batch_size, seed);
     case LLAISYS_DTYPE_BF16:
-        return rand_sample_<llaisys::bf16_t>(sample_idx, sample_val, vals, temperature, topK, topP, numel, batch_size, seed);
+        return rand_sample_<llaisys::bf16_t>(sample_idx, sample_val, vals, 
+            temperature, topK, topP, numel, batch_size, seed);
     case LLAISYS_DTYPE_F16:
-        return rand_sample_<llaisys::fp16_t>(sample_idx, sample_val, vals, temperature, topK, topP, numel, batch_size, seed);
+        return rand_sample_<llaisys::fp16_t>(sample_idx, sample_val, vals, 
+            temperature, topK, topP, numel, batch_size, seed);
     default:
         EXCEPTION_UNSUPPORTED_DATATYPE(type);
     }
