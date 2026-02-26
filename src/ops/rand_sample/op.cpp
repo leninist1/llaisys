@@ -4,6 +4,7 @@
 #include "../../utils.hpp"
 
 #include "cpu/rand_sample_cpu.hpp"
+#include "nvidia/rand_sample_nvidia.hpp"
 
 namespace llaisys::ops {
 void rand_sample(tensor_t sample_idx, tensor_t sample_val, tensor_t vals, float temperature, size_t topK, float topP,
@@ -43,8 +44,8 @@ void rand_sample(tensor_t sample_idx, tensor_t sample_val, tensor_t vals, float 
                                 static_cast<int64_t>(batch_size), temperature, topK, topP, seed);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
-        return;
+        return nvidia::rand_sample(sample_idx->data(), sample_val->data(), vals->data(), vals->dtype(), numel,
+                                   static_cast<int64_t>(batch_size), temperature, topK, topP, seed);
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
