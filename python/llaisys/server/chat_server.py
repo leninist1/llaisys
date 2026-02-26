@@ -2,11 +2,14 @@ import os
 import time
 import uuid
 import json
+import threading
+from pathlib import Path
 from typing import List, Optional, Iterable
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from starlette.responses import StreamingResponse, JSONResponse
+from starlette.responses import StreamingResponse, JSONResponse, FileResponse
+from starlette.staticfiles import StaticFiles
 from transformers import AutoTokenizer
 
 import llaisys
@@ -38,6 +41,13 @@ class AppState:
 
 state = AppState()
 app = FastAPI()
+model_lock = threading.Lock()
+
+WEBUI_INDEX = Path(__file__).resolve().parent.parent / "webUI" / "index.html"
+WEBUI_DIR = WEBUI_INDEX.parent.parent
+WEBUI_ENABLED = WEBUI_INDEX.is_file()
+if WEBUI_ENABLED:
+    app.mount("/webUI", StaticFiles(directory=WEBUI_DIR), name="webUI")
 
 # map device name to llaisys device type
 def llaisys_device(device_name: str):
@@ -153,14 +163,15 @@ def chat_completions(req: ChatRequest):
     request_id = "chatcmpl-" + uuid.uuid4().hex
 
     if not req.stream:
-        completion_text, completion_tokens = generate_full(
-            input_ids=input_ids,
-            max_tokens=max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            seed=req.seed,
-        )
+        with model_lock:
+            completion_text, completion_tokens = generate_full(
+                input_ids=input_ids,
+                max_tokens=max_tokens,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                seed=req.seed,
+            )
         response = {
             "id": request_id,
             "object": "chat.completion",
@@ -182,44 +193,55 @@ def chat_completions(req: ChatRequest):
         return JSONResponse(response)
 
     def event_stream():
-        yield sse_chunk(
-            {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": req.model or state.model_name,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-        )
-        for delta in generate_stream(
-            input_ids=input_ids,
-            max_tokens=max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            seed=req.seed,
-        ):
+        model_lock.acquire()
+        try:
             yield sse_chunk(
                 {
                     "id": request_id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": req.model or state.model_name,
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                 }
             )
-        yield sse_chunk(
-            {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": req.model or state.model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-        )
-        yield "data: [DONE]\n\n"
+            for delta in generate_stream(
+                input_ids=input_ids,
+                max_tokens=max_tokens,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                seed=req.seed,
+            ):
+                yield sse_chunk(
+                    {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": req.model or state.model_name,
+                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                    }
+                )
+            yield sse_chunk(
+                {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": req.model or state.model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+            )
+            yield "data: [DONE]\n\n"
+        finally:
+            model_lock.release()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/")
+def chat_ui():
+    if WEBUI_ENABLED:
+        return FileResponse(WEBUI_INDEX)
+    raise HTTPException(status_code=404, detail="Web UI not found")
 
 
 if __name__ == "__main__":
