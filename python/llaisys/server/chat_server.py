@@ -252,7 +252,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=8000, type=int)
     parser.add_argument("--model_path", default=None)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="nvidia")
     parser.add_argument("--model_name", default="llaisys-qwen2")
     args = parser.parse_args()
 

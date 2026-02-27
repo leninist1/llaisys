@@ -6,9 +6,11 @@ from ..libllaisys import llaisysDeviceType_t
 from ..libllaisys.models import LlaisysQwen2Meta
 
 from pathlib import Path
+import os
 import safetensors
 import json
 import ctypes
+import torch
 
 
 class Qwen2:
@@ -36,9 +38,11 @@ class Qwen2:
         end_token = int(config["eos_token_id"])
         
 
+        dtype = self._select_dtype(device)
+        self._dtype = dtype
         # construct C struct LlaisysQwen2Meta
         meta = LlaisysQwen2Meta(
-            dtype=DataType.BF16,
+            dtype=dtype,
             nlayer=nlayer,
             hs=hs,
             nh=nh,
@@ -52,7 +56,6 @@ class Qwen2:
             end_token=end_token,
         )
 
-        # only use cpu
         device_ids = (ctypes.c_int * 1)(0)
         # create model instance
         self._model = LIB_LLAISYS.llaisysQwen2ModelCreate(
@@ -72,7 +75,11 @@ class Qwen2:
                 if weight is None:
                     continue
                 # load weight to c side
-                arr = data_.get_tensor(name_).contiguous() #c-contiguous
+                arr = data_.get_tensor(name_)
+                torch_dtype = self._torch_dtype(self._dtype)
+                if arr.dtype != torch_dtype:
+                    arr = arr.to(torch_dtype)
+                arr = arr.contiguous()
                 
                 LIB_LLAISYS.tensorLoad(weight, ctypes.c_void_p(arr.data_ptr()))
 
@@ -125,6 +132,27 @@ class Qwen2:
         if tail == "mlp.down_proj.weight":
             return w.mlp_down_w[layer]
         return None
+
+    def _select_dtype(self, device: DeviceType) -> DataType:
+        dtype_env = os.environ.get("LLAISYS_DTYPE", "").strip().lower()
+        if dtype_env in ("f16", "float16"):
+            return DataType.F16
+        if dtype_env in ("f32", "float32"):
+            return DataType.F32
+        if dtype_env in ("bf16", "bfloat16"):
+            return DataType.BF16
+        if device == DeviceType.NVIDIA:
+            return DataType.F32
+        return DataType.BF16
+
+    def _torch_dtype(self, dtype: DataType):
+        if dtype == DataType.F16:
+            return torch.float16
+        if dtype == DataType.F32:
+            return torch.float32
+        if dtype == DataType.BF16:
+            return torch.bfloat16
+        return torch.float32
 
     def _infer(self, tokens: Sequence[int], temperature: float, top_k: int, top_p: float, seed: int) -> int:
         # step forward infer

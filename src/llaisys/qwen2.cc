@@ -2,6 +2,7 @@
 #include "llaisys_tensor.hpp"
 
 #include "../tensor/tensor.hpp"
+#include "../core/llaisys_core.hpp"
 #include "../ops/add/op.hpp"
 #include "../ops/rand_sample/op.hpp"
 #include "../ops/embedding/op.hpp"
@@ -14,7 +15,12 @@
 #include "../utils.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <algorithm>
+#include <cstdlib>
+#include <limits>
+#include <unordered_map>
 #include <vector>
 
 // wrap c++ tensor to external handle
@@ -40,8 +46,13 @@ llaisys::tensor_t make_tensor_dtype(
 
 // set tensor data to zero
 void zero_tensor(const llaisys::tensor_t &t) {
-    CHECK_ARGUMENT(t->deviceType() == LLAISYS_DEVICE_CPU, "Zero: only CPU is supported.");
-    std::memset(t->data(), 0, t->numel() * t->elementSize());
+    size_t size = t->numel() * t->elementSize();
+    if (t->deviceType() == LLAISYS_DEVICE_CPU) {
+        std::memset(t->data(), 0, size);
+        return;
+    }
+    std::vector<uint8_t> zeros(size);
+    t->load(zeros.data());
 }
 
 // wrap c++ tensor to external handle and record to handles list
@@ -52,6 +63,315 @@ llaisysTensor_t wrap_tensor(
     handles.push_back(h);
     return h;
 }
+
+size_t ceil_div(size_t a, size_t b) {
+    return (a + b - 1) / b;
+}
+
+size_t read_env_size_t(const char *name, size_t default_value) {
+    const char *value = std::getenv(name);
+    if (!value) {
+        return default_value;
+    }
+    char *end = nullptr;
+    unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return default_value;
+    }
+    return static_cast<size_t>(parsed);
+}
+
+uint64_t hash_mix(uint64_t h, int64_t v, uint64_t base) {
+    return h * base + (static_cast<uint64_t>(v) + 0x9e3779b97f4a7c15ull);
+}
+
+struct KVPagePoolLayer {
+    std::vector<llaisys::tensor_t> k_pages;
+    std::vector<llaisys::tensor_t> v_pages;
+    std::vector<size_t> refcnt;
+    std::vector<uint64_t> last_access;
+    std::vector<size_t> free_ids;
+    std::vector<uint8_t> is_free;
+};
+
+class KVCachePool {
+public:
+    void init(const LlaisysQwen2Meta &meta, llaisysDeviceType_t device, int device_id, size_t page_len, size_t max_pages) {
+        meta_ = meta;
+        device_ = device;
+        device_id_ = device_id;
+        page_len_ = page_len;
+        max_pages_ = max_pages;
+        access_clock_ = 1;
+        layers_.assign(meta.nlayer, KVPagePoolLayer{});
+    }
+
+    size_t page_len() const {
+        return page_len_;
+    }
+
+    size_t acquire_page(size_t layer) {
+        auto &pool = layers_[layer];
+        while (!pool.free_ids.empty()) {
+            size_t id = pool.free_ids.back();
+            pool.free_ids.pop_back();
+            if (pool.is_free[id] && pool.refcnt[id] == 0) {
+                pool.is_free[id] = 0;
+                pool.last_access[id] = access_clock_++;
+                return id;
+            }
+        }
+
+        if (pool.k_pages.size() < max_pages_) {
+            size_t id = pool.k_pages.size();
+            pool.k_pages.push_back(make_tensor(meta_, device_, device_id_, {page_len_, meta_.nkvh, meta_.dh}));
+            pool.v_pages.push_back(make_tensor(meta_, device_, device_id_, {page_len_, meta_.nkvh, meta_.dh}));
+            pool.refcnt.push_back(0);
+            pool.last_access.push_back(access_clock_++);
+            pool.is_free.push_back(0);
+            return id;
+        }
+
+        size_t selected = std::numeric_limits<size_t>::max();
+        uint64_t best_access = std::numeric_limits<uint64_t>::max();
+        for (size_t i = 0; i < pool.k_pages.size(); ++i) {
+            if (pool.refcnt[i] == 0 && pool.last_access[i] <= best_access) {
+                best_access = pool.last_access[i];
+                selected = i;
+            }
+        }
+        CHECK_ARGUMENT(selected != std::numeric_limits<size_t>::max(), "KV cache pool has no free page.");
+        pool.is_free[selected] = 0;
+        pool.last_access[selected] = access_clock_++;
+        return selected;
+    }
+
+    void incref(size_t layer, size_t page_id) {
+        auto &pool = layers_[layer];
+        if (pool.is_free[page_id]) {
+            pool.is_free[page_id] = 0;
+        }
+        pool.refcnt[page_id] += 1;
+        pool.last_access[page_id] = access_clock_++;
+    }
+
+    void decref(size_t layer, size_t page_id) {
+        auto &pool = layers_[layer];
+        if (pool.refcnt[page_id] > 0) {
+            pool.refcnt[page_id] -= 1;
+            if (pool.refcnt[page_id] == 0 && !pool.is_free[page_id]) {
+                pool.is_free[page_id] = 1;
+                pool.free_ids.push_back(page_id);
+            }
+        }
+        pool.last_access[page_id] = access_clock_++;
+    }
+
+    llaisys::tensor_t k_page(size_t layer, size_t page_id) {
+        auto &pool = layers_[layer];
+        pool.last_access[page_id] = access_clock_++;
+        return pool.k_pages[page_id];
+    }
+
+    llaisys::tensor_t v_page(size_t layer, size_t page_id) {
+        auto &pool = layers_[layer];
+        pool.last_access[page_id] = access_clock_++;
+        return pool.v_pages[page_id];
+    }
+
+private:
+    LlaisysQwen2Meta meta_;
+    llaisysDeviceType_t device_;
+    int device_id_;
+    size_t page_len_;
+    size_t max_pages_;
+    uint64_t access_clock_ = 1;
+    std::vector<KVPagePoolLayer> layers_;
+};
+
+struct KVHandle {
+    std::vector<std::vector<size_t>> layer_pages;
+    size_t token_count = 0;
+    uint64_t last_access = 0;
+    std::vector<int64_t> tokens;
+    std::vector<uint64_t> hash_keys;
+};
+
+class PrefixCacheIndex {
+public:
+    void init(size_t max_handles) {
+        max_handles_ = max_handles;
+        access_clock_ = 1;
+        handles_.clear();
+        alive_.clear();
+        key_to_handles_.clear();
+        free_handle_ids_.clear();
+    }
+
+    size_t find_longest_prefix(const int64_t *tokens, size_t ntoken, const KVCachePool &pool, KVHandle &out_handle) {
+        if (ntoken == 0) {
+            return 0;
+        }
+        auto hashes = prefix_hashes(tokens, ntoken);
+        for (size_t len = ntoken; len > 0; --len) {
+            uint64_t key = make_key(hashes[len], len);
+            auto it = key_to_handles_.find(key);
+            if (it == key_to_handles_.end()) {
+                continue;
+            }
+            for (size_t handle_id : it->second) {
+                if (handle_id >= handles_.size() || !alive_[handle_id]) {
+                    continue;
+                }
+                const auto &h = handles_[handle_id];
+                if (h.tokens.size() < len) {
+                    continue;
+                }
+                if (!std::equal(tokens, tokens + len, h.tokens.begin())) {
+                    continue;
+                }
+                size_t pages_needed = ceil_div(len, pool.page_len());
+                out_handle.layer_pages.assign(h.layer_pages.size(), {});
+                for (size_t i = 0; i < h.layer_pages.size(); ++i) {
+                    out_handle.layer_pages[i].assign(h.layer_pages[i].begin(), h.layer_pages[i].begin() + pages_needed);
+                }
+                out_handle.token_count = len;
+                out_handle.tokens.assign(tokens, tokens + len);
+                out_handle.last_access = access_clock_++;
+                handles_[handle_id].last_access = out_handle.last_access;
+                return len;
+            }
+        }
+        return 0;
+    }
+
+    void insert_handle(const KVHandle &handle, const int64_t *tokens, size_t ntoken, KVCachePool &pool) {
+        if (ntoken == 0) {
+            return;
+        }
+        size_t handle_id = acquire_handle_id();
+        if (handle_id >= handles_.size()) {
+            handles_.resize(handle_id + 1);
+            alive_.resize(handle_id + 1, 0);
+        }
+        if (alive_[handle_id]) {
+            release_handle(handle_id, pool);
+        }
+        KVHandle stored;
+        stored.token_count = ntoken;
+        stored.tokens.assign(tokens, tokens + ntoken);
+        stored.layer_pages = handle.layer_pages;
+        size_t pages_needed = ceil_div(ntoken, pool.page_len());
+        for (size_t i = 0; i < stored.layer_pages.size(); ++i) {
+            if (stored.layer_pages[i].size() > pages_needed) {
+                stored.layer_pages[i].resize(pages_needed);
+            }
+            for (size_t page_id : stored.layer_pages[i]) {
+                pool.incref(i, page_id);
+            }
+        }
+        auto hashes = prefix_hashes(tokens, ntoken);
+        stored.hash_keys.reserve(ntoken);
+        for (size_t len = 1; len <= ntoken; ++len) {
+            uint64_t key = make_key(hashes[len], len);
+            key_to_handles_[key].push_back(handle_id);
+            stored.hash_keys.push_back(key);
+        }
+        stored.last_access = access_clock_++;
+        handles_[handle_id] = std::move(stored);
+        alive_[handle_id] = 1;
+        enforce_capacity(pool);
+    }
+
+    void release_handle(size_t handle_id, KVCachePool &pool) {
+        if (handle_id >= handles_.size() || !alive_[handle_id]) {
+            return;
+        }
+        auto &h = handles_[handle_id];
+        for (size_t i = 0; i < h.layer_pages.size(); ++i) {
+            for (size_t page_id : h.layer_pages[i]) {
+                pool.decref(i, page_id);
+            }
+        }
+        for (uint64_t key : h.hash_keys) {
+            auto it = key_to_handles_.find(key);
+            if (it == key_to_handles_.end()) {
+                continue;
+            }
+            auto &vec = it->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), handle_id), vec.end());
+            if (vec.empty()) {
+                key_to_handles_.erase(it);
+            }
+        }
+        h.layer_pages.clear();
+        h.tokens.clear();
+        h.hash_keys.clear();
+        alive_[handle_id] = 0;
+        free_handle_ids_.push_back(handle_id);
+    }
+
+private:
+    uint64_t make_key(uint64_t hash, size_t len) const {
+        return hash ^ (salt_ * static_cast<uint64_t>(len));
+    }
+
+    std::vector<uint64_t> prefix_hashes(const int64_t *tokens, size_t ntoken) const {
+        std::vector<uint64_t> hashes(ntoken + 1);
+        uint64_t h = 0;
+        for (size_t i = 0; i < ntoken; ++i) {
+            h = hash_mix(h, tokens[i], base_);
+            hashes[i + 1] = h;
+        }
+        return hashes;
+    }
+
+    size_t acquire_handle_id() {
+        if (!free_handle_ids_.empty()) {
+            size_t id = free_handle_ids_.back();
+            free_handle_ids_.pop_back();
+            return id;
+        }
+        return handles_.size();
+    }
+
+    void enforce_capacity(KVCachePool &pool) {
+        if (max_handles_ == 0) {
+            return;
+        }
+        size_t alive_count = 0;
+        for (uint8_t v : alive_) {
+            alive_count += v;
+        }
+        while (alive_count > max_handles_) {
+            size_t oldest = std::numeric_limits<size_t>::max();
+            uint64_t oldest_access = std::numeric_limits<uint64_t>::max();
+            for (size_t i = 0; i < handles_.size(); ++i) {
+                if (!alive_[i]) {
+                    continue;
+                }
+                if (handles_[i].last_access <= oldest_access) {
+                    oldest_access = handles_[i].last_access;
+                    oldest = i;
+                }
+            }
+            if (oldest == std::numeric_limits<size_t>::max()) {
+                break;
+            }
+            release_handle(oldest, pool);
+            alive_count -= 1;
+        }
+    }
+
+    uint64_t base_ = 1469598103934665603ull;
+    uint64_t salt_ = 1099511628211ull;
+    size_t max_handles_ = 64;
+    uint64_t access_clock_ = 1;
+    std::unordered_map<uint64_t, std::vector<size_t>> key_to_handles_;
+    std::vector<KVHandle> handles_;
+    std::vector<uint8_t> alive_;
+    std::vector<size_t> free_handle_ids_;
+};
 
 }
 
@@ -76,11 +396,27 @@ struct LlaisysQwen2Model {
     llaisys::tensor_t out_bias;                  
 
     // KV cache
-    std::vector<llaisys::tensor_t> k_cache;
-    std::vector<llaisys::tensor_t> v_cache;
-
+    KVCachePool kv_pool;
+    PrefixCacheIndex prefix_index;
+    KVHandle active_handle;
+    bool active_valid;
     size_t cache_len;
 };
+
+static void release_active_handle(LlaisysQwen2Model *model) {
+    if (!model || !model->active_valid) {
+        return;
+    }
+    for (size_t i = 0; i < model->active_handle.layer_pages.size(); ++i) {
+        for (size_t page_id : model->active_handle.layer_pages[i]) {
+            model->kv_pool.decref(i, page_id);
+        }
+    }
+    model->active_handle.layer_pages.assign(model->meta.nlayer, {});
+    model->active_handle.tokens.clear();
+    model->active_handle.token_count = 0;
+    model->active_valid = false;
+}
 
 // init model weights, allocate memory and zero bias
 static void init_weights(LlaisysQwen2Model *model) {
@@ -186,13 +522,15 @@ static void init_weights(LlaisysQwen2Model *model) {
 // initialize kv cache tensor
 static void init_cache(LlaisysQwen2Model *model) {
     const auto &m = model->meta;
-    model->k_cache.resize(m.nlayer);
-    model->v_cache.resize(m.nlayer);
-    for (size_t i = 0; i < m.nlayer; ++i) {
-        // cache shape: [maxseq, num_heads, head_dim]
-        model->k_cache[i] = make_tensor(m, model->device, model->device_id, {m.maxseq, m.nkvh, m.dh});
-        model->v_cache[i] = make_tensor(m, model->device, model->device_id, {m.maxseq, m.nkvh, m.dh});
-    }
+    size_t page_len = read_env_size_t("LLAISYS_KV_PAGE_LEN", 128);
+    size_t max_pages = read_env_size_t("LLAISYS_KV_MAX_PAGES", ceil_div(m.maxseq, page_len));
+    size_t max_handles = read_env_size_t("LLAISYS_KV_MAX_HANDLES", 64);
+    model->kv_pool.init(m, model->device, model->device_id, page_len, max_pages);
+    model->prefix_index.init(max_handles);
+    model->active_handle.layer_pages.assign(m.nlayer, {});
+    model->active_handle.tokens.clear();
+    model->active_handle.token_count = 0;
+    model->active_valid = false;
     model->cache_len = 0;
 }
 
@@ -201,18 +539,44 @@ static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, si
                           size_t topK, float topP, int64_t seed) {
     CHECK_ARGUMENT(model != nullptr, "model is null");
     CHECK_ARGUMENT(token_ids != nullptr || ntoken == 0, "token_ids is null");
-    CHECK_ARGUMENT(model->device == LLAISYS_DEVICE_CPU, "Only CPU device is supported.");
+    CHECK_ARGUMENT(model->device == LLAISYS_DEVICE_CPU || model->device == LLAISYS_DEVICE_NVIDIA,
+                   "Unsupported device type.");
 
     if (ntoken == 0) {
         return model->meta.end_token;
     }
 
-    // prefill
-    if (ntoken > 1 || model->cache_len == 0) {
-        model->cache_len = 0;
+    size_t reuse_len = 0;
+    if (ntoken > 1) {
+        release_active_handle(model);
+        reuse_len = model->prefix_index.find_longest_prefix(token_ids, ntoken, model->kv_pool, model->active_handle);
+        if (reuse_len > 0) {
+            model->active_valid = true;
+            for (size_t i = 0; i < model->active_handle.layer_pages.size(); ++i) {
+                for (size_t page_id : model->active_handle.layer_pages[i]) {
+                    model->kv_pool.incref(i, page_id);
+                }
+            }
+        }
+        if (reuse_len >= ntoken) {
+            reuse_len = ntoken - 1;
+        }
+        if (model->active_valid) {
+            size_t max_pages = ceil_div(reuse_len, model->kv_pool.page_len());
+            for (size_t i = 0; i < model->active_handle.layer_pages.size(); ++i) {
+                while (model->active_handle.layer_pages[i].size() > max_pages) {
+                    size_t page_id = model->active_handle.layer_pages[i].back();
+                    model->active_handle.layer_pages[i].pop_back();
+                    model->kv_pool.decref(i, page_id);
+                }
+            }
+            model->active_handle.token_count = reuse_len;
+            model->active_handle.tokens.assign(token_ids, token_ids + reuse_len);
+        }
+        model->cache_len = reuse_len;
     }
 
-    size_t seqlen = ntoken;
+    size_t seqlen = ntoken - reuse_len;
     size_t pos_offset = model->cache_len;
 
     // position ID [pos_offset, pos_offset + seqlen)
@@ -223,7 +587,7 @@ static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, si
 
     // input token and position ID tensors
     auto input_ids = make_tensor_dtype(LLAISYS_DTYPE_I64, model->device, model->device_id, {seqlen});
-    input_ids->load(token_ids);
+    input_ids->load(token_ids + reuse_len);
 
     auto pos_tensor = make_tensor_dtype(LLAISYS_DTYPE_I64, model->device, model->device_id, {seqlen});
     pos_tensor->load(pos_ids.data());
@@ -234,6 +598,21 @@ static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, si
 
     // attn scale factor
     float scale = 1.0f / std::sqrt(static_cast<float>(model->meta.dh));
+
+    size_t total_len = model->cache_len + seqlen;
+    size_t page_len = model->kv_pool.page_len();
+    size_t pages_needed = ceil_div(total_len, page_len);
+    if (model->active_handle.layer_pages.size() != model->meta.nlayer) {
+        model->active_handle.layer_pages.assign(model->meta.nlayer, {});
+    }
+    for (size_t i = 0; i < model->meta.nlayer; ++i) {
+        while (model->active_handle.layer_pages[i].size() < pages_needed) {
+            size_t page_id = model->kv_pool.acquire_page(i);
+            model->kv_pool.incref(i, page_id);
+            model->active_handle.layer_pages[i].push_back(page_id);
+            model->active_valid = true;
+        }
+    }
 
     // layer forward
     for (size_t i = 0; i < model->meta.nlayer; ++i) {
@@ -262,17 +641,43 @@ static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, si
         llaisys::ops::rope(q_rope, q_view, pos_tensor, model->meta.theta);
         llaisys::ops::rope(k_rope, k_view, pos_tensor, model->meta.theta);
 
-        // write new k/v to cache
-        auto k_cache_slice = model->k_cache[i]->slice(0, model->cache_len, model->cache_len + seqlen);
-        auto v_cache_slice = model->v_cache[i]->slice(0, model->cache_len, model->cache_len + seqlen);
+        size_t write_offset = model->cache_len;
+        size_t remaining = seqlen;
+        size_t src_offset = 0;
+        while (remaining > 0) {
+            size_t page_index = write_offset / page_len;
+            size_t page_offset = write_offset % page_len;
+            size_t chunk = std::min(remaining, page_len - page_offset);
+            size_t page_id = model->active_handle.layer_pages[i][page_index];
+            auto k_page = model->kv_pool.k_page(i, page_id);
+            auto v_page = model->kv_pool.v_page(i, page_id);
+            auto k_page_slice = k_page->slice(0, page_offset, page_offset + chunk);
+            auto v_page_slice = v_page->slice(0, page_offset, page_offset + chunk);
+            auto k_chunk = k_rope->slice(0, src_offset, src_offset + chunk);
+            auto v_chunk = v_view->slice(0, src_offset, src_offset + chunk);
+            llaisys::ops::rearrange(k_page_slice, k_chunk);
+            llaisys::ops::rearrange(v_page_slice, v_chunk);
+            write_offset += chunk;
+            src_offset += chunk;
+            remaining -= chunk;
+        }
 
-        llaisys::ops::rearrange(k_cache_slice, k_rope);
-        llaisys::ops::rearrange(v_cache_slice, v_view);
-
-        // get all history k/v
-        size_t total_len = model->cache_len + seqlen;
-        auto k_total = model->k_cache[i]->slice(0, 0, total_len);
-        auto v_total = model->v_cache[i]->slice(0, 0, total_len);
+        auto k_total = make_tensor(model->meta, model->device, model->device_id, {total_len, model->meta.nkvh, model->meta.dh});
+        auto v_total = make_tensor(model->meta, model->device, model->device_id, {total_len, model->meta.nkvh, model->meta.dh});
+        size_t read_offset = 0;
+        for (size_t page_index = 0; page_index < pages_needed; ++page_index) {
+            size_t chunk = std::min(page_len, total_len - read_offset);
+            size_t page_id = model->active_handle.layer_pages[i][page_index];
+            auto k_page = model->kv_pool.k_page(i, page_id);
+            auto v_page = model->kv_pool.v_page(i, page_id);
+            auto k_page_slice = k_page->slice(0, 0, chunk);
+            auto v_page_slice = v_page->slice(0, 0, chunk);
+            auto k_total_slice = k_total->slice(0, read_offset, read_offset + chunk);
+            auto v_total_slice = v_total->slice(0, read_offset, read_offset + chunk);
+            llaisys::ops::rearrange(k_total_slice, k_page_slice);
+            llaisys::ops::rearrange(v_total_slice, v_page_slice);
+            read_offset += chunk;
+        }
 
         // self attn
         auto attn = make_tensor(model->meta, model->device, model->device_id, {seqlen, model->meta.nh, model->meta.dh});
@@ -315,6 +720,18 @@ static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, si
 
     // update cache len
     model->cache_len += seqlen;
+    model->active_handle.token_count = model->cache_len;
+    if (model->active_valid) {
+        if (model->active_handle.tokens.size() < model->cache_len) {
+            model->active_handle.tokens.insert(
+                model->active_handle.tokens.end(),
+                token_ids + reuse_len,
+                token_ids + reuse_len + seqlen);
+        }
+    }
+    if (ntoken > 1 && model->active_valid) {
+        model->prefix_index.insert_handle(model->active_handle, token_ids, ntoken, model->kv_pool);
+    }
 
     // final norm
     auto x_norm = make_tensor(model->meta, model->device, model->device_id, {seqlen, model->meta.hs});
@@ -330,7 +747,17 @@ static int64_t infer_impl(LlaisysQwen2Model *model, const int64_t *token_ids, si
     auto sample_val = make_tensor(model->meta, model->device, model->device_id, {1});
     llaisys::ops::rand_sample(sample_idx, sample_val, last, temperature, topK, topP, seed);
 
-    return reinterpret_cast<int64_t *>(sample_idx->data())[0];
+    if (model->device == LLAISYS_DEVICE_CPU) {
+        return reinterpret_cast<int64_t *>(sample_idx->data())[0];
+    }
+    int64_t host_value = 0;
+    llaisys::core::context().setDevice(model->device, model->device_id);
+    llaisys::core::context().runtime().api()->memcpy_sync(
+        &host_value,
+        sample_idx->data(),
+        sizeof(int64_t),
+        LLAISYS_MEMCPY_D2H);
+    return host_value;
 }
 
 // C API wrapper

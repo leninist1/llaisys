@@ -273,6 +273,23 @@
         };
       }
 
+      function safeParseJson(data) {
+        try {
+          return JSON.parse(data);
+        } catch (err) {
+          const first = data.indexOf("{");
+          const last = data.lastIndexOf("}");
+          if (first !== -1 && last !== -1 && last > first) {
+            try {
+              return JSON.parse(data.slice(first, last + 1));
+            } catch (innerErr) {
+              return null;
+            }
+          }
+          return null;
+        }
+      }
+
       async function requestCompletion(messages, assistantIndex) {
         const payload = buildRequest(messages);
         try {
@@ -283,7 +300,9 @@
               body: JSON.stringify(payload)
             });
             if (!res.ok) throw new Error("请求失败: " + res.status);
-            const data = await res.json();
+            const text = await res.text();
+            const data = safeParseJson(text);
+            if (!data) throw new Error("响应不是合法JSON");
             const content = data.choices?.[0]?.message?.content || "";
             updateMessageContent(assistantIndex, content);
             return;
@@ -302,10 +321,11 @@
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
-            const parts = buffer.split("\\n\\n");
+            buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+            const parts = buffer.split("\n\n");
             buffer = parts.pop();
             for (const part of parts) {
-              const lines = part.split("\\n");
+              const lines = part.split("\n");
               for (const line of lines) {
                 if (!line.startsWith("data: ")) continue;
                 const data = line.slice(6).trim();
@@ -313,7 +333,8 @@
                   updateMessageContent(assistantIndex, current);
                   return;
                 }
-                const payload = JSON.parse(data);
+                const payload = safeParseJson(data);
+                if (!payload) continue;
                 const delta = payload.choices?.[0]?.delta?.content || "";
                 if (delta) {
                   current += delta;
