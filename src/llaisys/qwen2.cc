@@ -69,6 +69,20 @@ size_t ceil_div(size_t a, size_t b) {
 }
 
 size_t read_env_size_t(const char *name, size_t default_value) {
+#ifdef _WIN32
+    char *value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || value == nullptr) {
+        return default_value;
+    }
+    char *end = nullptr;
+    unsigned long long parsed = std::strtoull(value, &end, 10);
+    std::free(value);
+    if (end == value || *end != '\0') {
+        return default_value;
+    }
+    return static_cast<size_t>(parsed);
+#else
     const char *value = std::getenv(name);
     if (!value) {
         return default_value;
@@ -79,6 +93,7 @@ size_t read_env_size_t(const char *name, size_t default_value) {
         return default_value;
     }
     return static_cast<size_t>(parsed);
+#endif
 }
 
 uint64_t hash_mix(uint64_t h, int64_t v, uint64_t base) {
